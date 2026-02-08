@@ -1,0 +1,9 @@
+version: 2
+
+sources:
+  - name: raw
+    database: iceberg
+    schema: raw
+    tables:
+      - name: yellow_trips
+        description: "Raw NYC yellow taxi trip data loaded into Iceberg"

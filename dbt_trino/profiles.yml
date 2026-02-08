@@ -1,0 +1,13 @@
+lakehouse_transfor:
+  target: dev
+  outputs:
+    dev:
+      type: trino
+      method: none
+      user: admin
+      
+      host: localhost
+      port: 8085
+      database: iceberg
+      schema: silver
+      threads: 1
