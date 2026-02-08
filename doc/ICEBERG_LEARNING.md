@@ -275,3 +275,135 @@ opening it. Inside you'll see all snapshots listed:
   ]
 }
 ```
+
+## Deep Dive: Iceberg Metadata Layers Explained
+
+Iceberg has 5 layers, top to bottom. Each layer serves a specific purpose.
+
+### Layer 0: Catalog (REST + Postgres)
+
+The **entry point** for everything. The only mutable layer — everything below it
+is immutable files in S3.
+
+It answers one question: **"Given a table name, where is the current metadata file?"**
+
+In our setup:
+
+- **REST catalog** (`tabulario/iceberg-rest` on port 8181) — the API layer
+- **Postgres** — the backing store that holds the actual pointer
+
+When Trino asks for `iceberg.raw.yellow_trips`:
+
+```text
+Trino: "Hey REST catalog, where is raw.yellow_trips?"
+REST catalog: *queries Postgres*
+Postgres: "Current metadata is at s3://warehouse/raw/yellow_trips-xxx/metadata/00002-xxx.metadata.json"
+REST catalog: *returns that location to Trino*
+Trino: *reads the JSON file from MinIO and follows the chain down*
+```
+
+This is why the catalog is critical. There might be 3 metadata JSON files in MinIO
+(from different writes), but only the catalog knows **which one is current**. When a
+new write happens, the catalog atomically updates its pointer to the new metadata file.
+
+Without a catalog, nobody knows which metadata file to read. The catalog is the
+single source of truth for "what is the latest version of this table?"
+
+### Layer 1: Metadata File (.json)
+
+The **table's master record**. One current file per table (old versions stay for time travel).
+
+Contains:
+
+- Table schema (column names, types)
+- Partition spec (how the table is partitioned, if at all)
+- A **list of all snapshots** (every version of the table)
+- Which snapshot is **current**
+
+```json
+{
+  "format-version": 2,
+  "table-uuid": "abc-123",
+  "current-snapshot-id": 999,
+  "schemas": [{"fields": [{"name": "vendor_id", "type": "int"}, ...]}],
+  "snapshots": [
+    {"snapshot-id": 111, "manifest-list": "s3://warehouse/.../snap-111.avro"},
+    {"snapshot-id": 999, "manifest-list": "s3://warehouse/.../snap-999.avro"}
+  ]
+}
+```
+
+**Analogy:** The table of contents of a book. It tells you every chapter (snapshot)
+that exists and where to find each one.
+
+### Layer 2: Manifest List (.avro)
+
+One per snapshot. Lists **which manifest files** belong to that snapshot.
+
+For a simple table with one insert, it points to 1 manifest. For a table with
+years of daily inserts, it might point to hundreds.
+
+Also stores **summary stats** per manifest (partition ranges, record counts), so
+the query engine can skip entire manifests without opening them.
+
+```text
+snap-999.avro contains:
+  - manifest-1.avro  (has data for Jan 2024, 5000 rows)
+  - manifest-2.avro  (has data for Feb 2024, 3000 rows)
+```
+
+**Analogy:** A chapter's table of contents. If you're looking for March data,
+you can skip manifest-1 and manifest-2 without reading them.
+
+### Layer 3: Manifest File (.avro)
+
+Tracks a group of **actual data files**. For each data file it stores:
+
+- File path in S3 (`s3://warehouse/.../00000.parquet`)
+- Row count
+- File size
+- **Column-level stats**: min value, max value, null count per column
+
+```text
+manifest-1.avro contains:
+  - 00000.parquet  (500 rows, trip_distance min=0.5, max=25.3)
+  - 00001.parquet  (500 rows, trip_distance min=0.1, max=18.7)
+```
+
+**Analogy:** The index at the back of a book. If you're looking for trips > 30 miles,
+you see max is 25.3 — you **skip this entire file** without reading it.
+
+This is Iceberg's secret weapon for performance — **file pruning** based on column stats.
+
+### Layer 4: Data File (.parquet)
+
+The actual rows. A standard Parquet file sitting in MinIO. Nothing Iceberg-specific
+about the file itself — it's just Parquet.
+
+### How a query uses all 4 layers
+
+When you run `SELECT * FROM stg_yellow_trips WHERE trip_distance > 20`:
+
+```text
+Step 1: Catalog (Postgres)
+        "stg_yellow_trips metadata is at 00000-xxx.metadata.json"
+
+Step 2: Read metadata file (.json)
+        "current snapshot is 999, manifest list is at snap-999.avro"
+
+Step 3: Read manifest list (.avro)
+        "this snapshot has 1 manifest: manifest-1.avro"
+
+Step 4: Read manifest file (.avro)
+        "manifest-1 has 1 data file: 00000.parquet"
+        Check column stats: trip_distance max = 25.3
+        → max > 20, so we MUST read this file
+        (if max was < 20, we'd SKIP it entirely — zero I/O)
+
+Step 5: Read data file (.parquet)
+        Open 00000.parquet and return matching rows
+```
+
+For the raw table with 20 parquet files, Trino reads the manifest, checks stats
+for each file, and **skips files** where no rows could match the query. This is
+how Iceberg queries stay fast even with thousands of files.
