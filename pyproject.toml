@@ -10,6 +10,9 @@ dependencies = [
     "requests>=2.32.0",
     "boto3>=1.35.0",
     "dbt-trino>=1.10.1",
+    "dagster>=1.12.14",
+    "dagster-webserver>=1.12.14",
+    "dagster-dbt>=0.28.14",
 ]
 
 [build-system]
@@ -18,3 +21,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["lakehouse_pipeline"]
+
+[tool.dagster]
+module_name = "lakehouse_pipeline.definitions"
