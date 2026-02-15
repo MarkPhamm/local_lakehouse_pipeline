@@ -407,3 +407,106 @@ Step 5: Read data file (.parquet)
 For the raw table with 20 parquet files, Trino reads the manifest, checks stats
 for each file, and **skips files** where no rows could match the query. This is
 how Iceberg queries stay fast even with thousands of files.
+
+## Deep Dive: Metadata File Examples
+
+Below are concrete examples of each metadata layer's contents.
+
+### metadata.json — Table Metadata File
+
+The top-level file that defines the table. Each schema change, partition spec change,
+or property update creates a new version.
+
+```json
+{
+  "format-version": 2,
+  "table-uuid": "a1b2c3d4-...",
+  "location": "s3://warehouse/raw/yellow_trips",
+  "last-sequence-number": 40,
+  "last-updated-ms": 1708012345678,
+  "last-column-id": 19,
+  "current-schema-id": 0,
+  "schemas": [{
+    "schema-id": 0,
+    "fields": [
+      {"id": 1, "name": "vendorid", "type": "int", "required": false},
+      {"id": 2, "name": "tpep_pickup_datetime", "type": "timestamp", "required": false},
+      {"id": 3, "name": "fare_amount", "type": "double", "required": false}
+    ]
+  }],
+  "current-snapshot-id": 1234567890,
+  "snapshots": [
+    {
+      "snapshot-id": 1234567890,
+      "timestamp-ms": 1708012345678,
+      "summary": {
+        "operation": "append",
+        "added-data-files": "1",
+        "total-records": "10000"
+      },
+      "manifest-list": "s3://warehouse/.../snap-1234567890-m0.avro"
+    }
+  ],
+  "snapshot-log": [
+    {"timestamp-ms": 1708012300000, "snapshot-id": 1234567880},
+    {"timestamp-ms": 1708012345678, "snapshot-id": 1234567890}
+  ]
+}
+```
+
+**Purpose**: Tracks the current schema, partition spec, sort order, and a list of all
+snapshots. The `current-snapshot-id` points to the "active" version of the table.
+
+### Manifest List (Avro) — `snap-<id>.avro`
+
+Each snapshot points to one manifest list. It's an Avro file listing which manifest
+files make up that snapshot. Conceptually:
+
+| manifest_path | added_snapshot_id | added_data_files | existing_data_files | deleted_data_files | partition_summary |
+|---|---|---|---|---|---|
+| `s3://.../m0.avro` | 1234567880 | 20 | 0 | 0 | `pickup_date: [2024-01-01, 2024-01-31]` |
+| `s3://.../m1.avro` | 1234567890 | 20 | 0 | 0 | `pickup_date: [2024-01-01, 2024-01-15]` |
+
+**Purpose**: Lets Iceberg do **snapshot-level pruning** — when querying a specific
+snapshot, it knows exactly which manifest files to read. Also enables **partition
+pruning** at this level via the summary stats.
+
+### Manifest File (Avro) — `m0.avro`
+
+Each manifest file lists the actual **data files** (parquet) with per-file statistics.
+Conceptually:
+
+| file_path | format | record_count | file_size | lower_bounds | upper_bounds | null_count |
+|---|---|---|---|---|---|---|
+| `s3://.../00001.parquet` | PARQUET | 500 | 14KB | `{fare: 2.5, dist: 0.1}` | `{fare: 95.0, dist: 28.3}` | `{fare: 0, dist: 0}` |
+| `s3://.../00002.parquet` | PARQUET | 500 | 14KB | `{fare: 3.0, dist: 0.2}` | `{fare: 112.0, dist: 31.1}` | `{fare: 0, dist: 0}` |
+
+**Purpose**: Enables **file-level pruning**. A query like `WHERE fare_amount > 100`
+can skip parquet files whose `upper_bounds.fare` is below 100 without ever opening them.
+
+### Why many manifest lists but few metadata files?
+
+**metadata.json** is rewritten only when the table's **structural definition** changes
+(schema, partition spec, properties) or when the engine decides to consolidate. Regular
+data operations (INSERT, DELETE) add new snapshots **inside** the same metadata file.
+Iceberg periodically writes a new version (`v2.metadata.json`, `v3.metadata.json`), but
+each new version contains the full cumulative state. So there are relatively few.
+
+**Manifest lists** are created **once per snapshot**, and every commit creates a new
+snapshot. In our pipeline, each batch INSERT of 500 rows = 1 new snapshot = 1 new
+manifest list. With 20 batch inserts, that's 20+ manifest lists but only ~3 metadata files.
+
+```text
+metadata.json (v3 — latest, has all 21 snapshots listed)
+  ├── snapshot 1 → snap-001.avro (manifest list)
+  │     └── m0.avro → 00001.parquet
+  ├── snapshot 2 → snap-002.avro (manifest list)
+  │     └── m1.avro → 00002.parquet
+  ├── snapshot 3 → snap-003.avro (manifest list)
+  │     └── m2.avro → 00003.parquet
+  ... (20 more snapshots, each with its own manifest list)
+```
+
+The metadata file is like a **book** — you don't reprint the entire book for each
+new chapter. You add chapters (snapshots) inside it. But each chapter (snapshot)
+needs its own table of contents (manifest list) to track which data files belong to it.
