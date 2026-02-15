@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from dagster import AssetExecutionContext
-from dagster_dbt import DbtCliResource, DbtProject, dbt_assets
+from dagster_dbt import DagsterDbtTranslator, DbtCliResource, DbtProject, dbt_assets
 
 
 dbt_project = DbtProject(
@@ -10,6 +10,11 @@ dbt_project = DbtProject(
 dbt_project.prepare_if_dev()
 
 
-@dbt_assets(manifest=dbt_project.manifest_path)
+class CustomDbtTranslator(DagsterDbtTranslator):
+    def get_group_name(self, dbt_resource_props):
+        return "transforms"
+
+
+@dbt_assets(manifest=dbt_project.manifest_path, dagster_dbt_translator=CustomDbtTranslator())
 def lakehouse_dbt_assets(context: AssetExecutionContext, dbt: DbtCliResource):
     yield from dbt.cli(["build"], context=context).stream()

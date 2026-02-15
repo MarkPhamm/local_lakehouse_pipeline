@@ -2,7 +2,7 @@ import requests
 import pyarrow.parquet as pq
 from pathlib import Path
 
-from dagster import asset, AssetExecutionContext, Output, MetadataValue
+from dagster import asset, AssetExecutionContext, AssetKey, Output, MetadataValue
 
 from lakehouse_pipeline.resources.trino_resource import TrinoResource
 
@@ -88,7 +88,7 @@ def raw_taxi_file(context: AssetExecutionContext) -> Output[str]:
     )
 
 
-@asset(group_name="ingestion", deps=[iceberg_schemas])
+@asset(key=AssetKey(["raw", "yellow_trips"]), group_name="ingestion", deps=[iceberg_schemas])
 def iceberg_raw_yellow_trips(
     context: AssetExecutionContext,
     raw_taxi_file: str,
