@@ -1,4 +1,5 @@
 # Local Lakehouse Pipeline
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/12ec4803-bf3a-4fbe-9187-f007ca84775e" />
 
 Building a local lakehouse with Dagster, MinIO, Iceberg, Trino, and dbt to learn Apache Iceberg from scratch.
 
