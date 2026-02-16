@@ -140,3 +140,112 @@ After a run completes:
 - Click a run to see logs, timing, and metadata per asset
 - Click an individual asset to see its metadata (e.g., `rows_inserted: 10000`)
 - Check Trino to verify data: `SELECT COUNT(*) FROM iceberg.raw.yellow_trips;`
+
+## Dagster vs Airflow
+
+### The Core Difference
+
+**Airflow** thinks in **tasks** — "run this, then run that."
+**Dagster** thinks in **assets** — "this data should exist, here's how to produce it."
+
+In Airflow you define a DAG of operations. In Dagster you define data assets and
+their dependencies — the execution order is inferred automatically.
+
+### Hello World: Side by Side
+
+**Airflow — a task that prints hello:**
+
+```python
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+
+
+def say_hello():
+    print("Hello, world!")
+
+
+with DAG(
+    dag_id="hello_world",
+    start_date=datetime(2024, 1, 1),
+    schedule="@daily",
+) as dag:
+    hello_task = PythonOperator(
+        task_id="say_hello",
+        python_callable=say_hello,
+    )
+```
+
+You define a DAG, add tasks to it, and set a schedule. The focus is on the
+*operation* (printing hello). To chain tasks:
+
+```python
+download_task = PythonOperator(task_id="download", python_callable=download_fn)
+transform_task = PythonOperator(task_id="transform", python_callable=transform_fn)
+load_task = PythonOperator(task_id="load", python_callable=load_fn)
+
+download_task >> transform_task >> load_task
+```
+
+Dependencies are explicit arrows between tasks. Data passing between tasks uses
+XCom (a sidecar key-value store), which is clunky for large datasets.
+
+**Dagster — an asset that produces data:**
+
+```python
+from dagster import asset
+
+
+@asset
+def hello_world():
+    return "Hello, world!"
+```
+
+That's it. The function *is* the asset. To chain assets:
+
+```python
+@asset
+def raw_data():
+    return download()
+
+
+@asset
+def clean_data(raw_data):
+    return transform(raw_data)
+
+
+@asset
+def report(clean_data):
+    return aggregate(clean_data)
+```
+
+Dependencies are inferred from function parameters — `clean_data` takes `raw_data`
+as input, so Dagster knows to run `raw_data` first. No explicit wiring needed.
+
+### Feature Comparison
+
+| | **Dagster** | **Airflow** |
+|---|---|---|
+| **Core unit** | Asset (data output) | Task (operation) |
+| **Dependencies** | Inferred from function params | Explicit `>>` operator |
+| **Data passing** | Native — assets return values | XCom (key-value, awkward for large data) |
+| **Data lineage** | Built-in — UI shows asset graph | Manual — must build yourself |
+| **Local dev** | `dagster dev` — instant hot-reload UI | Need scheduler + webserver + DB |
+| **Testing** | Assets are plain functions — easy to unit test | Tasks coupled to DAG context — harder |
+| **Resources** | Typed, swappable (swap real DB for mock in tests) | Connections/hooks, less structured |
+| **Backfills** | Native — "rematerialize for these partitions" | Possible but clunky |
+| **Scheduling** | Schedules, sensors, or manual | Primarily cron-based DAGs |
+| **dbt integration** | First-class (`dagster-dbt`) | Via `BashOperator` or `cosmos` |
+
+### When to Use Which
+
+**Dagster** is better for:
+- Data pipelines and analytics engineering
+- dbt-centric workflows
+- When you care about *what data exists* and its lineage
+- Teams that want easy local development and testing
+
+**Airflow** is better for:
+- General-purpose orchestration (triggering APIs, sending emails, coordinating services)
+- Organizations with existing Airflow infrastructure
+- When you need a massive ecosystem of pre-built operators (AWS, GCP, Slack, etc.)
