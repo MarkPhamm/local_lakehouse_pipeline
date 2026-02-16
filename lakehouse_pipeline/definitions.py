@@ -1,4 +1,4 @@
-from dagster import Definitions, define_asset_job, AssetSelection
+from dagster import Definitions, define_asset_job, AssetSelection, ScheduleDefinition
 from dagster_dbt import DbtCliResource
 
 from lakehouse_pipeline.assets.ingestion import (
@@ -18,6 +18,12 @@ lakehouse_full_pipeline = define_asset_job(
 )
 
 
+lakehouse_daily_schedule = ScheduleDefinition(
+    job=lakehouse_full_pipeline,
+    cron_schedule="0 9 * * 1",  # Every Monday at 9:00 AM
+)
+
+
 defs = Definitions(
     assets=[
         iceberg_schemas,
@@ -26,6 +32,7 @@ defs = Definitions(
         lakehouse_dbt_assets,
     ],
     jobs=[lakehouse_full_pipeline],
+    schedules=[lakehouse_daily_schedule],
     resources={
         "trino_resource": TrinoResource(),
         "dbt": DbtCliResource(
