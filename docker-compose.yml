@@ -1,5 +1,5 @@
 # Local Lakehouse Docker Compose
-# 
+#
 # Services:
 #   - minio — S3-compatible object storage where Iceberg data files live
 #   - mc — one-shot init container that creates the warehouse bucket then exits
@@ -8,32 +8,42 @@
 #   - trino — SQL query engine that talks to the Iceberg catalog to read/write tables
 
 services:
+
+  # ─── MinIO: S3-compatible object storage ───
+  # Stores all Iceberg data files (parquet) and metadata files.
+  # Think of it as a local AWS S3.
   minio:
-    image: minio/minio
-    container_name: minio
+    image: minio/minio                    # Official MinIO image from Docker Hub
+    container_name: minio                 # Fixed name so other containers can reference it
     environment:
-      MINIO_ROOT_USER: admin
-      MINIO_ROOT_PASSWORD: password
-      MINIO_DOMAIN: minio
+      MINIO_ROOT_USER: admin              # Login username for MinIO console and API
+      MINIO_ROOT_PASSWORD: password       # Login password for MinIO console and API
+      MINIO_DOMAIN: minio                 # Enables virtual-host-style URLs (bucket.minio)
     networks:
       lakehouse_net:
         aliases:
-          - warehouse.minio
+          - warehouse.minio               # Allows S3 virtual-host access: http://warehouse.minio:9000
+                                          # The REST catalog uses this to resolve s3://warehouse/ URLs
     volumes:
-      - minio_data:/data
+      - minio_data:/data                  # Persist stored objects across container restarts
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "9000:9000"                       # S3 API port (used by Trino, REST catalog, scripts)
+      - "9001:9001"                       # MinIO web console (browse buckets at http://localhost:9001)
     command: ["server", "/data", "--console-address", ":9001"]
+                                          # Start MinIO server, store data in /data,
+                                          # serve the web console on port 9001
 
+  # ─── MC: MinIO Client init container ───
+  # Runs once on startup to create the "warehouse" bucket, then exits.
+  # This is a one-shot setup container, not a long-running service.
   mc:
-    image: minio/mc
+    image: minio/mc                       # Official MinIO client CLI
     container_name: mc
     depends_on:
-      - minio
+      - minio                             # Wait for MinIO to start first
     networks:
-      - lakehouse_net
-    entrypoint: >
+      - lakehouse_net                     # Must be on same network to reach MinIO
+    entrypoint: >                         # Override default entrypoint with a shell script
       /bin/sh -c "
         until /usr/bin/mc alias set minio http://minio:9000 admin password; do
           echo 'waiting for minio...' && sleep 1;
@@ -42,61 +52,96 @@ services:
         /usr/bin/mc anonymous set public minio/warehouse;
         exit 0;
       "
+      # Line by line:
+      #   1. Keep retrying to register MinIO as alias "minio" until it's reachable
+      #   2. Create the "warehouse" bucket (skip if it already exists)
+      #   3. Set the bucket to public so all services can read/write without auth headers
+      #   4. Exit — this container's job is done
 
+  # ─── Postgres: Catalog backing store ───
+  # The Iceberg REST catalog uses this to persist its table registry.
+  # Stores: which tables exist, and where each table's current metadata.json is in MinIO.
+  # This is NOT where your actual data lives — that's in MinIO.
   postgres:
-    image: postgres:16
+    image: postgres:16                    # PostgreSQL 16
     container_name: postgres
     environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: iceberg_catalog
+      POSTGRES_USER: admin                # DB superuser name
+      POSTGRES_PASSWORD: password         # DB superuser password
+      POSTGRES_DB: iceberg_catalog        # Database name — the REST catalog connects to this
     networks:
       - lakehouse_net
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
+      - postgres_data:/var/lib/postgresql/data   # Persist DB data across container restarts
+    healthcheck:                          # Health check so dependent services can wait for Postgres
       test: ["CMD-SHELL", "pg_isready -U admin -d iceberg_catalog"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+                                          # pg_isready returns 0 when Postgres accepts connections
+      interval: 5s                        # Check every 5 seconds
+      timeout: 5s                         # Fail if check takes longer than 5 seconds
+      retries: 5                          # Mark unhealthy after 5 consecutive failures
 
+  # ─── REST: Iceberg REST Catalog ───
+  # The "phone book" of the lakehouse. When Trino asks "where is table raw.yellow_trips?",
+  # the REST catalog looks it up in Postgres and returns the metadata.json location in MinIO.
   rest:
-    image: tabulario/iceberg-rest
+    image: tabulario/iceberg-rest         # Open-source Iceberg REST catalog implementation
     container_name: iceberg-rest
     depends_on:
       postgres:
-        condition: service_healthy
+        condition: service_healthy        # Only start after Postgres passes its healthcheck
     networks:
       - lakehouse_net
     ports:
-      - "8181:8181"
+      - "8181:8181"                       # REST API port (Trino connects here to discover tables)
     environment:
-      AWS_ACCESS_KEY_ID: admin
-      AWS_SECRET_ACCESS_KEY: password
-      AWS_REGION: us-east-1
-      CATALOG_WAREHOUSE: s3://warehouse/
+      # --- S3/MinIO credentials (so the catalog can read/write metadata files in MinIO) ---
+      AWS_ACCESS_KEY_ID: admin            # MinIO access key (same as MINIO_ROOT_USER)
+      AWS_SECRET_ACCESS_KEY: password     # MinIO secret key (same as MINIO_ROOT_PASSWORD)
+      AWS_REGION: us-east-1              # Required by S3 SDK but arbitrary for local MinIO
+      # --- Catalog configuration ---
+      CATALOG_WAREHOUSE: s3://warehouse/  # Root S3 path where all Iceberg table data is stored
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+                                          # Tells the catalog to use S3FileIO to read/write files
       CATALOG_S3_ENDPOINT: http://minio:9000
+                                          # Point S3 calls to MinIO instead of real AWS S3
+      # --- Postgres connection (where the catalog stores its registry) ---
       CATALOG_URI: jdbc:postgresql://postgres/iceberg_catalog
-      CATALOG_JDBC_USER: admin
-      CATALOG_JDBC_PASSWORD: password
+                                          # JDBC connection string to the Postgres database
+      CATALOG_JDBC_USER: admin            # Postgres username
+      CATALOG_JDBC_PASSWORD: password     # Postgres password
 
+  # ─── Trino: SQL query engine ───
+  # The user-facing SQL engine. Connects to the Iceberg REST catalog to discover tables,
+  # then reads/writes parquet files directly from MinIO.
+  # Trino does NOT store data — it's a compute engine that queries data where it lives.
   trino:
-    image: trinodb/trino
+    image: trinodb/trino                  # Official Trino image
     container_name: trino
     depends_on:
-      - rest
-      - minio
+      - rest                              # Needs the REST catalog to be running
+      - minio                             # Needs MinIO for reading/writing data files
     networks:
       - lakehouse_net
     ports:
-      - "8085:8080"
+      - "8085:8080"                       # Map host 8085 → container 8080 (Trino's default port)
+                                          # Access Trino UI at http://localhost:8085
+                                          # Port 8080 was already in use on this machine
     volumes:
       - ./docker/trino/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties
+                                          # Mount the Iceberg catalog config into Trino.
+                                          # This file tells Trino: use the Iceberg connector,
+                                          # connect to REST catalog at http://rest:8181,
+                                          # and access S3 at http://minio:9000
 
+# ─── Network ───
+# All services share this network so they can reach each other by container name
+# (e.g., Trino can call http://rest:8181, REST catalog can call http://minio:9000)
 networks:
   lakehouse_net:
 
+# ─── Volumes ───
+# Named volumes persist data across docker compose down/up cycles.
+# Delete them with: docker compose down -v
 volumes:
-  minio_data:
-  postgres_data:
+  minio_data:                             # MinIO stored objects (parquet files, metadata)
+  postgres_data:                          # Postgres database files (catalog registry)
